@@ -791,6 +791,10 @@ let username = 'user-' + Math.floor(Math.random() * 900 + 100);
 let currentRoomId = null, isHost = false, peers = {};
 let isMicMuted = false, isVideoOff = false, isChatOpen = false, unread = 0;
 let localStream = null, myPeer = null, screenShareStream = null;
+// Incoming media calls that arrive before our local stream is ready (e.g. the
+// user is still granting camera/mic permission) are buffered here, then
+// answered once the stream exists — never silently dropped.
+let pendingCalls = [];
 
 const videoGrid = $('videoGrid'), emptyState = $('emptyState');
 const meetingIdInput = $('meetingIdInput'), createRoomBtn = $('createRoomBtn'), joinRoomBtn = $('joinRoomBtn');
@@ -957,10 +961,19 @@ async function callPeer(peerId, stream) {
 }
 
 function answerCall(call, peerId) {
-  if (!localStream) return;
+  // Media may not be ready yet (user still granting camera/mic permission).
+  // Buffer the call instead of silently dropping it — otherwise this peer
+  // never sees us, with no retry. flushPendingCalls() drains the queue.
+  if (!localStream) { pendingCalls.push({ call, peerId }); return; }
   call.answer(localStream);
   call.on('stream', s => addRemoteVideo(peerId, s, peers[peerId]?.username));
   call.on('close', () => removeRemoteVideo(peerId));
+}
+
+function flushPendingCalls() {
+  const queued = pendingCalls;
+  pendingCalls = [];
+  queued.forEach(({ call, peerId }) => answerCall(call, peerId));
 }
 
 function sharePeerList(conn, newId) {
@@ -993,6 +1006,7 @@ function setupDataConn(conn, peerId) {
 async function initHost(id) {
   if (myPeer) myPeer.destroy();
   peers = {};
+  pendingCalls = [];
   videoGrid.innerHTML = '';
   myPeer = new Peer(id, { config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] } });
   myPeer.on('open', async () => {
@@ -1003,6 +1017,7 @@ async function initHost(id) {
     try {
       localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       addLocalTile();
+      flushPendingCalls();
     } catch(e) {
       addMsg('System', 'Camera or mic access denied', false, true);
       setStatus('media error', 'error');
@@ -1027,11 +1042,6 @@ async function initHost(id) {
     peers[pid].call = call;
   });
   myPeer.on('connection', conn => {
-    function relay(data) {
-      for (const pid in peers) {
-        if (peers[pid].dataConnection !== conn && peers[pid].dataConnection?.open) peers[pid].dataConnection.send(data);
-      }
-    }
     conn.on('open', () => {
       const cp = conn.peer;
       if (!peers[cp]) peers[cp] = { dataConnection: conn, username: cp.slice(0, 6), call: null };
@@ -1046,11 +1056,11 @@ async function initHost(id) {
         addMsg('System', `${peers[pid].username} joined`, false, true);
         updateCount();
       } else if (data.type === 'chat') {
+        // No relay: the full mesh already delivers each message directly to
+        // every participant. Relaying here double-delivers to other clients.
         addMsg(data.sender, data.text);
-        relay(data);
       } else if (['file-meta','file-chunk','file-done'].includes(data.type)) {
         handleFile(data);
-        relay(data);
       }
     });
     conn.on('close', () => {
@@ -1069,6 +1079,7 @@ async function initHost(id) {
 async function initClient(id) {
   if (myPeer) myPeer.destroy();
   peers = {};
+  pendingCalls = [];
   videoGrid.innerHTML = '';
   myPeer = new Peer(undefined, { config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] } });
   myPeer.on('open', async myId => {
@@ -1078,6 +1089,7 @@ async function initClient(id) {
     try {
       localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       addLocalTile();
+      flushPendingCalls();
     } catch(e) {
       addMsg('System', 'Camera or mic access denied', false, true);
       setStatus('media error', 'error');
@@ -1134,33 +1146,49 @@ function toggleCam() {
   addLocalTile();
 }
 
+// Swap the outgoing video track on every live call WITHOUT tearing the call
+// down. replaceTrack needs no renegotiation and — unlike close()+re-call —
+// can't fire the 'close' handler that deletes the peer mid-iteration.
+function replaceVideoForPeers(track) {
+  for (const pid in peers) {
+    const pc = peers[pid].call && peers[pid].call.peerConnection;
+    if (!pc) continue;
+    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+    if (sender) sender.replaceTrack(track).catch(() => {});
+  }
+}
+
 async function toggleScreen() {
   if (screenShareStream) {
+    // Stop sharing → restore the camera. Only the video track is swapped, so
+    // the existing mic track (and its mute state) is preserved.
     screenShareStream.getTracks().forEach(t => t.stop());
     screenShareStream = null;
     try {
-      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const cam = await navigator.mediaDevices.getUserMedia({ video: true });
+      const camTrack = cam.getVideoTracks()[0];
+      const old = localStream.getVideoTracks()[0];
+      if (old) { localStream.removeTrack(old); old.stop(); }
+      localStream.addTrack(camTrack);
       isVideoOff = false;
       shareScreenBtn.classList.remove('scrn');
       shareScreenBtn.setAttribute('aria-label', 'Share screen');
       addLocalTile();
-      for (const pid in peers) {
-        if (peers[pid].call) { peers[pid].call.close(); peers[pid].call = await callPeer(pid, localStream); }
-      }
+      replaceVideoForPeers(camTrack);
     } catch(e) { addMsg('System', 'Could not restore camera', false, true); }
     return;
   }
   try {
     screenShareStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
     const track = screenShareStream.getVideoTracks()[0];
-    if (localStream.getVideoTracks()[0]) localStream.removeTrack(localStream.getVideoTracks()[0]);
+    const old = localStream.getVideoTracks()[0];
+    if (old) { localStream.removeTrack(old); old.stop(); }
     localStream.addTrack(track);
+    isVideoOff = false;
     shareScreenBtn.classList.add('scrn');
     shareScreenBtn.setAttribute('aria-label', 'Stop sharing screen');
     addLocalTile();
-    for (const pid in peers) {
-      if (peers[pid].call) { peers[pid].call.close(); peers[pid].call = await callPeer(pid, localStream); }
-    }
+    replaceVideoForPeers(track);
     track.onended = () => toggleScreen();
   } catch(e) { screenShareStream = null; addMsg('System', 'Screen share cancelled', false, true); }
 }
