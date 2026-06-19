@@ -786,6 +786,13 @@ body {
 // ── DOM HELPER ────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
 
+// ── CONFIG ────────────────────────────────────────────────────────────────
+// Single source of truth for the WebRTC + media setup. NOTE: a public STUN
+// server alone cannot traverse symmetric NAT — add a TURN server to this list
+// for reliable connectivity in production.
+const RTC_CONFIG = { config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] } };
+const MEDIA_CONSTRAINTS = { video: true, audio: true };
+
 // ── STATE ─────────────────────────────────────────────────────────────────
 let username = 'user-' + Math.floor(Math.random() * 900 + 100);
 let currentRoomId = null, isHost = false, peers = {};
@@ -861,7 +868,7 @@ function addMsg(sender, text, isOwn = false, isSys = false) {
 
 function broadcastChat(text) {
   const p = { type: 'chat', sender: username, text };
-  for (const id in peers) { const c = peers[id].dataConnection; if (c && c.open) c.send(p); }
+  broadcastData(p);
   addMsg(username, text, true);
 }
 
@@ -976,6 +983,14 @@ function flushPendingCalls() {
   queued.forEach(({ call, peerId }) => answerCall(call, peerId));
 }
 
+// Shared handler for inbound media calls — identical wiring for host and client.
+function handleIncomingCall(call) {
+  const pid = call.peer;
+  if (!peers[pid]) peers[pid] = { dataConnection: null, username: pid.slice(0, 6), call: null };
+  answerCall(call, pid);
+  peers[pid].call = call;
+}
+
 function sharePeerList(conn, newId) {
   const list = Object.keys(peers).filter(p => p !== newId);
   list.push(myPeer.id);
@@ -1008,14 +1023,14 @@ async function initHost(id) {
   peers = {};
   pendingCalls = [];
   videoGrid.innerHTML = '';
-  myPeer = new Peer(id, { config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] } });
+  myPeer = new Peer(id, RTC_CONFIG);
   myPeer.on('open', async () => {
     setStatus(id, 'active');
     currentRoomId = id;
     isHost = true;
     addMsg('System', `Room "${id}" created`, false, true);
     try {
-      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS);
       addLocalTile();
       flushPendingCalls();
     } catch(e) {
@@ -1035,12 +1050,7 @@ async function initHost(id) {
       console.error(err);
     }
   });
-  myPeer.on('call', call => {
-    const pid = call.peer;
-    if (!peers[pid]) peers[pid] = { dataConnection: null, username: pid.slice(0, 6), call: null };
-    answerCall(call, pid);
-    peers[pid].call = call;
-  });
+  myPeer.on('call', handleIncomingCall);
   myPeer.on('connection', conn => {
     conn.on('open', () => {
       const cp = conn.peer;
@@ -1081,13 +1091,13 @@ async function initClient(id) {
   peers = {};
   pendingCalls = [];
   videoGrid.innerHTML = '';
-  myPeer = new Peer(undefined, { config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] } });
+  myPeer = new Peer(undefined, RTC_CONFIG);
   myPeer.on('open', async myId => {
     setStatus('joining…', 'idle');
     currentRoomId = id;
     isHost = false;
     try {
-      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS);
       addLocalTile();
       flushPendingCalls();
     } catch(e) {
@@ -1110,12 +1120,7 @@ async function initClient(id) {
     addMsg('System', `Could not connect: ${err.type}`, false, true);
     joinSheet.classList.remove('hidden');
   });
-  myPeer.on('call', call => {
-    const pid = call.peer;
-    if (!peers[pid]) peers[pid] = { dataConnection: null, username: pid.slice(0, 6), call: null };
-    answerCall(call, pid);
-    peers[pid].call = call;
-  });
+  myPeer.on('call', handleIncomingCall);
   myPeer.on('connection', conn => {
     const pid = conn.peer;
     if (!peers[pid]) peers[pid] = { dataConnection: conn, username: pid.slice(0, 6), call: null };
